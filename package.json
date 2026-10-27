@@ -9,7 +9,8 @@
     "scripts": {
      "dev": "tsx watch src/server.ts",
      "migrate": "tsx src/migrate.ts",
-      "daemon": "tsx src/daemon.ts"
+      "daemon": "tsx src/daemon.ts",
+      "mock": "tsx mock/server.ts"
    },
   "keywords": [],
   "author": "",
