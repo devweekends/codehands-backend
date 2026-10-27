@@ -2,7 +2,7 @@ import "dotenv/config";
 import Fastify from "fastify";
 import pg from "pg";
 import { WebSocketServer, WebSocket } from "ws";
-
+import { authRoutes } from "./auth.js";
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const app = Fastify({ logger: true });
 
@@ -55,6 +55,8 @@ app.post("/commands", async (request, reply) => {
   return { commandId, sessionId, delivered: true };
 });
 
+ //add auth route today :)
+    await app.register(authRoutes, { pool });
 const port = Number(process.env.PORT ?? 3000);
 await app.listen({ port, host: "0.0.0.0" });
 
