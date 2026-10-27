@@ -41,3 +41,11 @@ create table if not exists commands (
 
 create index if not exists events_session_idx on events(session_id, id);
 create index if not exists commands_device_idx on commands(device_id, status);
+
+-- C3: per-device tokens (COD-313)
+alter table devices add column if not exists token_hash text;
+alter table devices add column if not exists revoked_at timestamptz;
+
+create unique index if not exists devices_token_hash_idx
+  on devices(token_hash) where token_hash is not null;
+create index if not exists devices_user_idx on devices(user_id);
