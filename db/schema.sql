@@ -49,3 +49,22 @@ alter table devices add column if not exists revoked_at timestamptz;
 create unique index if not exists devices_token_hash_idx
   on devices(token_hash) where token_hash is not null;
 create index if not exists devices_user_idx on devices(user_id);
+
+
+-- C3: synced records (COD-313)
+create sequence if not exists records_seq;
+
+create table if not exists records (
+  user_id    uuid   not null references users(id),
+  kind       text   not null check (kind in ('project','session','event','memory','preference')),
+  id         text   not null,
+  version    bigint not null,
+  deleted    boolean not null default false,
+  data       jsonb  not null default '{}',
+  seq        bigint not null default nextval('records_seq'),
+  device_id  uuid   references devices(id),
+  updated_at timestamptz not null default now(),
+  primary key (user_id, kind, id)
+);
+
+create index if not exists records_pull_idx on records(user_id, seq);
