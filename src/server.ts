@@ -3,6 +3,7 @@ import Fastify from "fastify";
 import pg from "pg";
 import { WebSocketServer, WebSocket } from "ws";
 import { authRoutes } from "./auth.js";
+import { syncRoutes } from "./sync.js";
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const app = Fastify({ logger: true });
 
@@ -57,6 +58,7 @@ app.post("/commands", async (request, reply) => {
 
  //add auth route today :)
     await app.register(authRoutes, { pool });
+    await app.register(syncRoutes, { pool });
 const port = Number(process.env.PORT ?? 3000);
 await app.listen({ port, host: "0.0.0.0" });
 
