@@ -1,10 +1,31 @@
 ﻿import { randomUUID } from "node:crypto";
 import { openDb } from "./db.js";
-import { canTransition } from "../../codehands-contracts/src/session.ts";
-import type { SessionStatus } from "../../codehands-contracts/src/session.ts";
+import {
+  canTransition,
+  type SessionStatus,
+} from "../../codehands-contracts/src/session.ts";
+import type {
+  Runner,
+  RunnerEvent,
+} from "../../codehands-contracts/src/runner.ts";
+import {
+  checkProvider,
+  getActiveProviderLimit,
+} from "./preflight.js";
+import { createFakeRunner } from "@codehands/runner";
+import { buildStartOptions } from "./start-options.js";
+import { saveRunnerEvent } from "./runner-events.js";
 
 const db = openDb();
 const NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
+
+const fakeMode = process.env.CODEHANDS_FAKE_RUNNER === "1";
+// Only the fake runner is enabled until real provider commands are verified.
+const runner: Runner = createFakeRunner({ delayMs: 300 });
+
+const activeRuns = new Set<string>();
+
+type Agent = "codex" | "claude-code";
 
 type Task = {
   id: string;
@@ -24,14 +45,38 @@ type Command = {
   kind: string;
 };
 
-function event(sessionId: string, type: string, payload: object = {}) {
-  const row = db.prepare(
-    "select coalesce(max(seq), 0) + 1 as seq from events where session_id = ?"
-  ).get(sessionId) as { seq: number };
+function isSupportedAgent(agent: string): agent is Agent {
+  return agent === "codex" || agent === "claude-code";
+}
 
-  db.prepare(
-    "insert into events (session_id, seq, type, payload) values (?, ?, ?, ?)"
-  ).run(sessionId, row.seq, type, JSON.stringify(payload));
+function event(
+  sessionId: string,
+  type: string,
+  payload: object = {}
+): void {
+  const row = db.prepare(`
+    SELECT COALESCE(MAX(seq), 0) + 1 AS seq
+    FROM events
+    WHERE session_id = ?
+  `).get(sessionId) as { seq: number };
+
+  db.prepare(`
+    INSERT INTO events (session_id, seq, type, payload)
+    VALUES (?, ?, ?, ?)
+  `).run(
+    sessionId,
+    row.seq,
+    type,
+    JSON.stringify(payload)
+  );
+}
+
+function getSession(sessionId: string): Session | undefined {
+  return db.prepare(`
+    SELECT id, status
+    FROM sessions
+    WHERE id = ?
+  `).get(sessionId) as Session | undefined;
 }
 
 function transition(
@@ -39,146 +84,497 @@ function transition(
   from: SessionStatus,
   to: SessionStatus,
   reason: string | null = null
-) {
+): void {
   if (!canTransition(from, to)) {
     throw new Error(`Illegal transition: ${from} -> ${to}`);
   }
 
-  const result = db.prepare(
-    `update sessions
-     set status = ?, reason = ?, updated_at = ${NOW}
-     where id = ? and status = ?`
-  ).run(to, reason, sessionId, from);
+  const result = db.prepare(`
+    UPDATE sessions
+    SET status = ?,
+        reason = ?,
+        updated_at = ${NOW}
+    WHERE id = ?
+      AND status = ?
+  `).run(to, reason, sessionId, from);
 
   if (result.changes !== 1) {
-    throw new Error("Session status changed concurrently");
+    throw new Error(
+      `Session status changed concurrently: ${sessionId}`
+    );
   }
 
   event(sessionId, "session.status_changed", {
     from,
     to,
-    reason
+    reason,
   });
 }
 
-function claimTasks() {
-  const tasks = db.prepare(
-    `select t.id, t.project_id, t.agent, t.models
-     from tasks t
-     where not exists (
-       select 1 from sessions s where s.task_id = t.id
-     )
-     order by t.created_at`
-  ).all() as Task[];
+function transitionIfAllowed(
+  sessionId: string,
+  to: SessionStatus,
+  reason: string | null = null
+): boolean {
+  const session = getSession(sessionId);
+
+  if (!session || !canTransition(session.status, to)) {
+    return false;
+  }
+
+  transition(sessionId, session.status, to, reason);
+  return true;
+}
+
+async function consumeRunnerEvents(
+  sessionId: string,
+  stream: AsyncIterable<RunnerEvent>
+): Promise<void> {
+  for await (const runnerEvent of stream) {
+    if (runnerEvent.sessionId !== sessionId) {
+      throw new Error(
+        `Runner event session mismatch: ${runnerEvent.sessionId}`
+      );
+    }
+
+    const dbSeq = saveRunnerEvent(runnerEvent);
+
+    console.log(
+      "Runner event:",
+      sessionId.slice(0, 8),
+      runnerEvent.type,
+      "DB seq:",
+      dbSeq
+    );
+
+    if (runnerEvent.type === "provider.status") {
+      const payload = runnerEvent.payload;
+
+      if (
+        (payload.agent === "codex" ||
+          payload.agent === "claude-code") &&
+        (
+          payload.state === "ok" ||
+          payload.state === "not_installed" ||
+          payload.state === "not_logged_in" ||
+          payload.state === "rate_limited" ||
+          payload.state === "usage_limited" ||
+          payload.state === "outage"
+        )
+      ) {
+        db.prepare(`
+          INSERT INTO provider_status (
+            agent, state, reason, retry_at, checked_at
+          )
+          VALUES (
+            ?, ?, ?, ?,
+            strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          )
+          ON CONFLICT(agent) DO UPDATE SET
+            state = excluded.state,
+            reason = excluded.reason,
+            retry_at = excluded.retry_at,
+            checked_at = excluded.checked_at
+        `).run(
+          payload.agent,
+          payload.state,
+          typeof payload.reason === "string"
+            ? payload.reason
+            : null,
+          typeof payload.retry_at === "string"
+            ? payload.retry_at
+            : null
+        );
+      }
+    }
+
+    if (runnerEvent.type === "approval.requested") {
+      const changed = transitionIfAllowed(sessionId, "awaiting_approval");
+      console.log("Approval transition:", changed ? "SUCCESS" : "FAILED", sessionId);
+    }
+
+    if (runnerEvent.type === "task.failed") {
+      const reason = typeof runnerEvent.payload.reason === "string"
+        ? runnerEvent.payload.reason
+        : "Runner failed";
+      transitionIfAllowed(sessionId, "failed", reason);
+    }
+
+    if (runnerEvent.type === "task.stopped") {
+      transitionIfAllowed(sessionId, "stopped");
+    }
+
+    if (runnerEvent.type === "task.finished") {
+      // Tahira's runner emits approval.requested after task.finished.
+      // Keep the session running until the approval event arrives.
+      console.log("Runner finished work; waiting for approval:", sessionId);
+    }
+  }
+}
+
+async function runSession(
+  sessionId: string,
+  resume = false
+): Promise<void> {
+  if (activeRuns.has(sessionId)) {
+    console.log("Session already running:", sessionId);
+    return;
+  }
+
+  activeRuns.add(sessionId);
+
+  try {
+    const stream = resume
+      ? runner.resume(sessionId)
+      : runner.start(buildStartOptions(sessionId));
+
+    await consumeRunnerEvents(sessionId, stream);
+  } catch (error) {
+    console.error("Runner failed:", sessionId, error);
+
+    const reason =
+      error instanceof Error
+        ? error.message
+        : String(error);
+
+    transitionIfAllowed(sessionId, "failed", reason);
+  } finally {
+    activeRuns.delete(sessionId);
+  }
+}
+
+function claimTasks(): void {
+  const tasks = db.prepare(`
+    SELECT t.id, t.project_id, t.agent, t.models
+    FROM tasks t
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM sessions s
+      WHERE s.task_id = t.id
+    )
+    ORDER BY t.created_at
+  `).all() as Task[];
 
   for (const task of tasks) {
-    db.transaction(() => {
-      const models = JSON.parse(task.models || "{}");
-      const model =
-        models.implement ??
-        Object.values(models)[0] ??
-        "unspecified";
+    try {
+      let providerState: string;
+      let providerReason: string | null = null;
+      let retryAt: string | null = null;
 
-      const sessionId = randomUUID();
+      if (!isSupportedAgent(task.agent)) {
+        providerState = "not_installed";
+        providerReason = `Unsupported agent: ${task.agent}`;
+      } else if (fakeMode) {
+        providerState = "ok";
+      } else {
+        const activeLimit = getActiveProviderLimit(task.agent);
 
-      const result = db.prepare(
-        `insert or ignore into sessions
-         (id, task_id, project_id, agent, model, status)
-         values (?, ?, ?, ?, ?, 'queued')`
-      ).run(
-        sessionId,
-        task.id,
-        task.project_id,
-        task.agent,
-        String(model)
-      );
-
-      if (result.changes === 1) {
-        event(sessionId, "task.claimed", {
-          taskId: task.id
-        });
-        console.log("Claimed task:", task.id.slice(0, 8));
+        if (activeLimit) {
+          providerState = activeLimit.state;
+          providerReason = activeLimit.reason;
+          retryAt = activeLimit.retry_at;
+        } else {
+          const provider = checkProvider(task.agent);
+          providerState = provider.state;
+          providerReason = provider.reason;
+          retryAt = provider.retry_at;
+        }
       }
-    })();
+
+      const claimedSessionId = db.transaction((): string | null => {
+        if (isSupportedAgent(task.agent) && !fakeMode) {
+          db.prepare(`
+            INSERT INTO provider_status (
+              agent, state, reason, retry_at, checked_at
+            )
+            VALUES (
+              ?, ?, ?, ?,
+              strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            )
+            ON CONFLICT(agent) DO UPDATE SET
+              state = excluded.state,
+              reason = excluded.reason,
+              retry_at = excluded.retry_at,
+              checked_at = excluded.checked_at
+          `).run(
+            task.agent,
+            providerState,
+            providerReason,
+            retryAt
+          );
+        }
+
+        const models = JSON.parse(task.models || "{}") as
+          Record<string, unknown>;
+
+        const model =
+          models.implement ??
+          Object.values(models)[0] ??
+          "unspecified";
+
+        const sessionId = randomUUID();
+
+        const result = db.prepare(`
+          INSERT OR IGNORE INTO sessions (
+            id, task_id, project_id, agent, model, status
+          )
+          VALUES (?, ?, ?, ?, ?, 'queued')
+        `).run(
+          sessionId,
+          task.id,
+          task.project_id,
+          task.agent,
+          String(model)
+        );
+
+        if (result.changes !== 1) {
+          return null;
+        }
+
+        event(sessionId, "task.claimed", {
+          taskId: task.id,
+        });
+
+        console.log(
+          "Claimed task:",
+          task.id.slice(0, 8)
+        );
+
+        if (providerState !== "ok") {
+          const reason =
+            providerReason ??
+            `Provider unavailable: ${providerState}`;
+
+          transition(sessionId, "queued", "failed", reason);
+
+          event(sessionId, "provider.preflight_refused", {
+            agent: task.agent,
+            state: providerState,
+            reason,
+            retry_at: retryAt,
+          });
+
+          console.log(
+            "Preflight refused:",
+            task.id.slice(0, 8),
+            reason
+          );
+
+          return null;
+        }
+
+        event(sessionId, "provider.preflight_passed", {
+          agent: task.agent,
+          state: providerState,
+        });
+
+        console.log(
+          "Preflight passed:",
+          task.id.slice(0, 8)
+        );
+
+        return sessionId;
+      })();
+
+      if (claimedSessionId && fakeMode) {
+        // Start outside the SQLite transaction.
+        transition(
+          claimedSessionId,
+          "queued",
+          "running"
+        );
+
+        void runSession(claimedSessionId);
+      }
+    } catch (error) {
+      console.error(
+        "Failed to claim task:",
+        task.id,
+        error
+      );
+    }
   }
 }
 
-function processCommands() {
-  const commands = db.prepare(
-    `select c.id, c.session_id, c.kind
-     from commands c
-     where not exists (
-       select 1 from command_receipts r
-       where r.command_id = c.id
-     )
-     order by c.created_at`
-  ).all() as Command[];
+function saveCommandReceipt(
+  commandId: string,
+  outcome: "done" | "refused",
+  reason: string | null
+): void {
+  db.prepare(`
+    INSERT OR IGNORE INTO command_receipts (
+      command_id, outcome, reason
+    )
+    VALUES (?, ?, ?)
+  `).run(commandId, outcome, reason);
+}
+
+async function processCommands(): Promise<void> {
+  const commands = db.prepare(`
+    SELECT c.id, c.session_id, c.kind
+    FROM commands c
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM command_receipts r
+      WHERE r.command_id = c.id
+    )
+    ORDER BY c.created_at
+  `).all() as Command[];
 
   for (const command of commands) {
-    db.transaction(() => {
-      const existing = db.prepare(
-        "select command_id from command_receipts where command_id = ?"
-      ).get(command.id);
+    let outcome: "done" | "refused" = "refused";
+    let reason: string | null = null;
 
-      if (existing) return;
-
-      let outcome: "done" | "refused" = "refused";
-      let reason: string | null = null;
-
-      const session = command.session_id
-        ? db.prepare(
-            "select id, status from sessions where id = ?"
-          ).get(command.session_id) as Session | undefined
-        : undefined;
-
-      if (!session) {
+    try {
+      if (!command.session_id) {
         reason = "Session not found or missing";
-      } else if (command.kind === "approve" ||
-                 command.kind === "reject") {
-        const next: SessionStatus =
-          command.kind === "approve" ? "approved" : "rejected";
-
-        if (canTransition(session.status, next)) {
-          transition(session.id, session.status, next);
-          outcome = "done";
-        } else {
-          reason = `Cannot ${command.kind} from ${session.status}`;
-        }
       } else {
-        reason = `${command.kind} requires runner integration`;
+        const session = getSession(command.session_id);
+
+        if (!session) {
+          reason = "Session not found";
+        } else if (!fakeMode) {
+          reason = "Real runner is not connected yet";
+        } else {
+          switch (command.kind) {
+            case "stop": {
+              if (session.status !== "running") {
+                reason = `Cannot stop from ${session.status}`;
+                break;
+              }
+
+              await runner.stop(session.id);
+              transitionIfAllowed(session.id, "stopped");
+              outcome = "done";
+              break;
+            }
+
+            case "resume": {
+              if (session.status !== "stopped") {
+                reason = `Cannot resume from ${session.status}`;
+                break;
+              }
+
+              if (activeRuns.has(session.id)) {
+                reason = "Runner is still active";
+                break;
+              }
+
+              transition(session.id, "stopped", "running");
+              void runSession(session.id, true);
+              outcome = "done";
+              break;
+            }
+
+            case "approve": {
+              if (!canTransition(session.status, "approved")) {
+                reason =
+                  `Cannot approve from ${session.status}`;
+                break;
+              }
+
+              const result = await runner.approve(
+                session.id,
+                "Approved by user"
+              );
+
+              db.prepare(`
+                UPDATE sessions
+                SET branch = ?,
+                    updated_at = ${NOW}
+                WHERE id = ?
+              `).run(result.branch, session.id);
+
+              transition(
+                session.id,
+                session.status,
+                "approved"
+              );
+
+              outcome = "done";
+              break;
+            }
+
+            case "reject": {
+              if (!canTransition(session.status, "rejected")) {
+                reason =
+                  `Cannot reject from ${session.status}`;
+                break;
+              }
+
+              await runner.reject(session.id);
+
+              transition(
+                session.id,
+                session.status,
+                "rejected"
+              );
+
+              outcome = "done";
+              break;
+            }
+
+            default:
+              reason =
+                `Unsupported command: ${command.kind}`;
+          }
+        }
       }
+    } catch (error) {
+      reason =
+        error instanceof Error
+          ? error.message
+          : String(error);
 
-      db.prepare(
-        `insert into command_receipts
-         (command_id, outcome, reason)
-         values (?, ?, ?)`
-      ).run(command.id, outcome, reason);
+      console.error(
+        "Command failed:",
+        command.kind,
+        error
+      );
+    }
 
-      console.log("Command:", command.kind, outcome, reason ?? "");
-    })();
+    saveCommandReceipt(command.id, outcome, reason);
+
+    console.log(
+      "Command:",
+      command.kind,
+      outcome,
+      reason ?? ""
+    );
   }
 }
 
-function recoverSessions() {
+function recoverSessions(): void {
   db.transaction(() => {
-    const sessions = db.prepare(
-      "select id, status from sessions where status = 'running'"
-    ).all() as Session[];
+    const sessions = db.prepare(`
+      SELECT id, status
+      FROM sessions
+      WHERE status = 'running'
+    `).all() as Session[];
 
     for (const session of sessions) {
       transition(
         session.id,
-        session.status,
+        "running",
         "failed",
         "Daemon restarted while session was running"
       );
-      console.log("Recovered interrupted session:", session.id);
+
+      console.log(
+        "Recovered interrupted session:",
+        session.id
+      );
     }
   })();
 }
 
-async function main() {
+async function main(): Promise<void> {
   console.log("CodeHands watcher starting...");
+  console.log(
+    "Runner mode:",
+    fakeMode ? "FAKE" : "REAL (not connected)"
+  );
+
   recoverSessions();
 
   console.log("Watching SQLite database every 500ms");
@@ -186,12 +582,14 @@ async function main() {
   while (true) {
     try {
       claimTasks();
-      processCommands();
-    } catch (err) {
-      console.error("Watcher error:", err);
+      await processCommands();
+    } catch (error) {
+      console.error("Watcher error:", error);
     }
 
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await new Promise<void>(resolve =>
+      setTimeout(resolve, 500)
+    );
   }
 }
 
