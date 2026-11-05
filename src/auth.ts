@@ -35,34 +35,146 @@ export function requireAuth(pool: pg.Pool) {
   };
 }
 
-// Ask GitHub who this code belongs to. The GitHub token is never stored.
-async function githubUser(code: string) {
-  const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
-    method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json" },
-    body: JSON.stringify({
-      client_id: process.env.GITHUB_CLIENT_ID,
-      client_secret: process.env.GITHUB_CLIENT_SECRET,
-      code,
-    }),
-  });
-  const tokenJson = (await tokenRes.json()) as { access_token?: string };
-  if (!tokenJson.access_token) return null;
 
-  const userRes = await fetch("https://api.github.com/user", {
-    headers: {
-      authorization: `Bearer ${tokenJson.access_token}`,
-      accept: "application/vnd.github+json",
-      "user-agent": "codehands-backend",
-    },
-  });
-  if (!userRes.ok) return null;
-  const u = (await userRes.json()) as { id: number; login: string };
-  return { id: String(u.id), login: u.login };
+
+// Ask GitHub who this code belongs to. The GitHub token is never stored.
+
+type GithubUser = {
+  id: string;
+  login: string;
+};
+
+class GithubInvalidCodeError extends Error {
+  constructor() {
+    super("GitHub authorization code is invalid or expired");
+    this.name = "GithubInvalidCodeError";
+  }
 }
 
-export async function authRoutes(app: FastifyInstance, opts: { pool: pg.Pool }) {
+class GithubServiceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GithubServiceError";
+  }
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+// Ask GitHub who this code belongs to.
+async function githubUser(
+  code: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<GithubUser> {
+  let tokenRes: Response;
+
+  try {
+    tokenRes = await fetchImpl(
+      "https://github.com/login/oauth/access_token",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify({
+          client_id: process.env.GITHUB_CLIENT_ID,
+          client_secret: process.env.GITHUB_CLIENT_SECRET,
+          code,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      }
+    );
+  } catch {
+    throw new GithubServiceError("GitHub OAuth request failed");
+  }
+
+  let tokenJson: unknown;
+
+  try {
+    tokenJson = await tokenRes.json();
+  } catch {
+    throw new GithubServiceError("Invalid response from GitHub OAuth");
+  }
+
+  if (
+    isObject(tokenJson) &&
+    tokenJson.error === "bad_verification_code"
+  ) {
+    throw new GithubInvalidCodeError();
+  }
+
+  if (!tokenRes.ok) {
+    throw new GithubServiceError(
+      `GitHub OAuth returned status ${tokenRes.status}`
+    );
+  }
+
+  if (
+    !isObject(tokenJson) ||
+    typeof tokenJson.access_token !== "string" ||
+    !tokenJson.access_token
+  ) {
+    throw new GithubServiceError("GitHub did not return an access token");
+  }
+
+  let userRes: Response;
+
+  try {
+    userRes = await fetchImpl("https://api.github.com/user", {
+      headers: {
+        authorization: `Bearer ${tokenJson.access_token}`,
+        accept: "application/vnd.github+json",
+        "user-agent": "codehands-backend",
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch {
+    throw new GithubServiceError("GitHub user request failed");
+  }
+
+  if (!userRes.ok) {
+    throw new GithubServiceError(
+      `GitHub user API returned status ${userRes.status}`
+    );
+  }
+
+  let userJson: unknown;
+
+  try {
+    userJson = await userRes.json();
+  } catch {
+    throw new GithubServiceError("Invalid GitHub user response");
+  }
+
+  if (
+    !isObject(userJson) ||
+    typeof userJson.id !== "number" ||
+    !Number.isSafeInteger(userJson.id) ||
+    userJson.id <= 0 ||
+    typeof userJson.login !== "string" ||
+    !userJson.login.trim()
+  ) {
+    throw new GithubServiceError("GitHub returned invalid user information");
+  }
+
+  return {
+    id: String(userJson.id),
+    login: userJson.login,
+  };
+}
+
+
+export async function authRoutes(
+  app: FastifyInstance,
+  opts: {
+    pool: pg.Pool;
+    fetchImpl?: typeof fetch;
+  }
+) {
   const { pool } = opts;
+  const fetchImpl = opts.fetchImpl ?? fetch;
 
   // Dev helper: GitHub sends you here after you approve. It just shows the code.
   app.get("/auth/github/callback", async (req: FastifyRequest, reply: FastifyReply) => {
@@ -71,41 +183,84 @@ export async function authRoutes(app: FastifyInstance, opts: { pool: pg.Pool }) 
     return code ? `Your code: ${code}` : "No code in the URL.";
   });
 
-  async function signIn(req: FastifyRequest, reply: FastifyReply) {
-    const { githubCode, deviceName } = (req.body ?? {}) as {
-      githubCode?: string;
-      deviceName?: string;
-    };
-    if (!githubCode || !deviceName) {
-      return reply.code(400).send({ error: "githubCode and deviceName are required" });
-    }
+ async function signIn(req: FastifyRequest, reply: FastifyReply) {
+  const { githubCode, deviceName } = (req.body ?? {}) as {
+    githubCode?: string;
+    deviceName?: string;
+  };
 
-    const gh = await githubUser(githubCode);
-    if (!gh) return reply.code(401).send({ error: "GitHub rejected the code" });
-
-    const u = await pool.query(
-      `insert into users (github_id, github_login) values ($1, $2)
-       on conflict (github_id) do update set github_login = excluded.github_login
-       returning id`,
-      [gh.id, gh.login]
-    );
-    const userId = u.rows[0].id;
-
-    // The real token is returned once. Only its hash goes in the database.
-    const deviceToken = randomBytes(32).toString("hex");
-    const d = await pool.query(
-      `insert into devices (user_id, name, token_hash) values ($1, $2, $3)
-       returning id, name, created_at`,
-      [userId, deviceName, hashToken(deviceToken)]
-    );
-    const row = d.rows[0];
-    return {
-      userId,
-      device: { id: row.id, name: row.name, createdAt: row.created_at },
-      deviceToken,
-    };
+  // Validate the incoming request
+  if (
+    typeof githubCode !== "string" ||
+    !githubCode.trim() ||
+    typeof deviceName !== "string" ||
+    !deviceName.trim()
+  ) {
+    return reply.code(400).send({
+      error: "githubCode and deviceName are required",
+    });
   }
 
+  // Authenticate the user through GitHub OAuth
+  let gh: GithubUser;
+
+  try {
+    gh = await githubUser(githubCode, fetchImpl);
+  } catch (error) {
+    // Invalid or expired GitHub authorization code
+    if (error instanceof GithubInvalidCodeError) {
+      return reply.code(401).send({
+        error: "GitHub authorization code is invalid or expired",
+      });
+    }
+
+    // Log unexpected GitHub errors without exposing credentials
+    req.log.error(
+      { err: error },
+      "GitHub authentication failed"
+    );
+
+    return reply.code(502).send({
+      error: "GitHub authentication service is temporarily unavailable",
+    });
+  }
+
+  // Create a new user or update the existing GitHub account
+  const u = await pool.query(
+    `insert into users (github_id, github_login)
+     values ($1, $2)
+     on conflict (github_id)
+     do update set github_login = excluded.github_login
+     returning id`,
+    [gh.id, gh.login]
+  );
+
+  const userId = u.rows[0].id;
+
+  // Generate a unique device token
+  const deviceToken = randomBytes(32).toString("hex");
+
+  // Store only the token hash in the database
+  const d = await pool.query(
+    `insert into devices (user_id, name, token_hash)
+     values ($1, $2, $3)
+     returning id, name, created_at`,
+    [userId, deviceName.trim(), hashToken(deviceToken)]
+  );
+
+  const row = d.rows[0];
+
+  // Return the actual device token only once
+  return {
+    userId,
+    device: {
+      id: row.id,
+      name: row.name,
+      createdAt: row.created_at,
+    },
+    deviceToken,
+  };
+}
   // With GitHub, sign up and log in do the same thing
   app.post("/auth/signup", signIn);
   app.post("/auth/login", signIn);
