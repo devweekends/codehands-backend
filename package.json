@@ -1,12 +1,12 @@
 {
   "name": "codehands-server",
   "version": "1.0.0",
-     "type": "module",
-     "bin": {
-  "codehands": "./bin/codehands.js"
-},
+  "type": "module",
+  "bin": {
+    "codehands": "./bin/codehands.js"
+  },
   "main": "index.js",
-      "scripts": {
+  "scripts": {
     "dev": "tsx watch src/server.ts",
     "migrate": "tsx src/migrate.ts",
     "daemon": "tsx src/daemon.ts",
@@ -29,5 +29,6 @@
     "@types/ws": "^8.18.2",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
-  }
+  },
+  "packageManager": "pnpm@10.17.1"
 }
