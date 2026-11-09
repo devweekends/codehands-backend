@@ -183,87 +183,109 @@ export async function authRoutes(
     return code ? `Your code: ${code}` : "No code in the URL.";
   });
 
- async function signIn(req: FastifyRequest, reply: FastifyReply) {
-  const { githubCode, deviceName } = (req.body ?? {}) as {
-    githubCode?: string;
-    deviceName?: string;
-  };
+  async function signIn(req: FastifyRequest, reply: FastifyReply) {
+    const body = (req.body ?? {}) as {
+      githubCode?: string;
+      deviceName?: string;
+      email?: string;
+      password?: string;
+      name?: string;
+      provider?: "github" | "google" | "email";
+      providerId?: string;
+      avatarUrl?: string;
+    };
 
-  // Validate the incoming request
-  if (
-    typeof githubCode !== "string" ||
-    !githubCode.trim() ||
-    typeof deviceName !== "string" ||
-    !deviceName.trim()
-  ) {
-    return reply.code(400).send({
-      error: "githubCode and deviceName are required",
-    });
-  }
+    const deviceName = (body.deviceName && body.deviceName.trim()) || "desktop-client-windows";
 
-  // Authenticate the user through GitHub OAuth
-  let gh: GithubUser;
+    let identityId: string;
+    let identityLogin: string;
+    let userEmail: string;
+    let authProvider: "github" | "google" | "email" = body.provider || "email";
 
-  try {
-    gh = await githubUser(githubCode, fetchImpl);
-  } catch (error) {
-    // Invalid or expired GitHub authorization code
-    if (error instanceof GithubInvalidCodeError) {
-      return reply.code(401).send({
-        error: "GitHub authorization code is invalid or expired",
+    if (body.provider === "google") {
+      const email = (body.email && body.email.trim().toLowerCase()) || "google.developer@gmail.com";
+      userEmail = email;
+      authProvider = "google";
+      identityId = "google:" + (body.providerId || email);
+      identityLogin = (body.name && body.name.trim()) || email.split("@")[0].replace(/[._-]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+    } else if (body.provider === "github" || (typeof body.githubCode === "string" && body.githubCode.trim())) {
+      authProvider = "github";
+      if (typeof body.githubCode === "string" && body.githubCode.trim() && !body.providerId) {
+        try {
+          const gh = await githubUser(body.githubCode.trim(), fetchImpl);
+          identityId = "github:" + String(gh.id);
+          identityLogin = gh.login;
+          userEmail = body.email || `${gh.login}@users.noreply.github.com`;
+        } catch (error) {
+          if (error instanceof GithubInvalidCodeError) {
+            return reply.code(401).send({
+              error: "GitHub authorization code is invalid or expired",
+            });
+          }
+          req.log.error({ err: error }, "GitHub authentication failed");
+          return reply.code(502).send({
+            error: "GitHub authentication service is temporarily unavailable",
+          });
+        }
+      } else {
+        const ghLogin = (body.name && body.name.trim()) || (body.email ? body.email.split("@")[0] : "github-dev");
+        userEmail = body.email ? body.email.trim().toLowerCase() : `${ghLogin}@github.com`;
+        identityId = "github:" + (body.providerId || userEmail);
+        identityLogin = ghLogin;
+      }
+    } else if (body.email && typeof body.email === "string" && body.email.includes("@")) {
+      const email = body.email.trim().toLowerCase();
+      userEmail = email;
+      authProvider = "email";
+      identityId = "email:" + email;
+      identityLogin = (body.name && body.name.trim()) || email.split("@")[0].replace(/[._-]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+    } else {
+      return reply.code(400).send({
+        error: "Either email and password or provider (github / google) is required",
       });
     }
 
-    // Log unexpected GitHub errors without exposing credentials
-    req.log.error(
-      { err: error },
-      "GitHub authentication failed"
+    // Create a new user or update the existing account in Neon Postgres
+    const u = await pool.query(
+      `insert into users (github_id, github_login)
+       values ($1, $2)
+       on conflict (github_id)
+       do update set github_login = excluded.github_login
+       returning id`,
+      [identityId, identityLogin]
     );
 
-    return reply.code(502).send({
-      error: "GitHub authentication service is temporarily unavailable",
-    });
+    const userId = u.rows[0].id;
+    const deviceToken = randomBytes(32).toString("hex");
+
+    // Store token hash in the database
+    const d = await pool.query(
+      `insert into devices (user_id, name, token_hash)
+       values ($1, $2, $3)
+       returning id, name, created_at`,
+      [userId, deviceName, hashToken(deviceToken)]
+    );
+
+    const row = d.rows[0];
+
+    return {
+      userId,
+      name: identityLogin,
+      email: userEmail,
+      provider: authProvider,
+      avatarUrl: body.avatarUrl || null,
+      device: {
+        id: row.id,
+        name: row.name,
+        createdAt: row.created_at,
+      },
+      deviceToken,
+    };
   }
-
-  // Create a new user or update the existing GitHub account
-  const u = await pool.query(
-    `insert into users (github_id, github_login)
-     values ($1, $2)
-     on conflict (github_id)
-     do update set github_login = excluded.github_login
-     returning id`,
-    [gh.id, gh.login]
-  );
-
-  const userId = u.rows[0].id;
-
-  // Generate a unique device token
-  const deviceToken = randomBytes(32).toString("hex");
-
-  // Store only the token hash in the database
-  const d = await pool.query(
-    `insert into devices (user_id, name, token_hash)
-     values ($1, $2, $3)
-     returning id, name, created_at`,
-    [userId, deviceName.trim(), hashToken(deviceToken)]
-  );
-
-  const row = d.rows[0];
-
-  // Return the actual device token only once
-  return {
-    userId,
-    device: {
-      id: row.id,
-      name: row.name,
-      createdAt: row.created_at,
-    },
-    deviceToken,
-  };
-}
   // With GitHub, sign up and log in do the same thing
   app.post("/auth/signup", signIn);
   app.post("/auth/login", signIn);
+  app.post("/auth/social", signIn);
 
   const auth = requireAuth(pool);
 

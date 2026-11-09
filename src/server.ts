@@ -7,8 +7,58 @@ import { syncRoutes } from "./sync.js";
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const app = Fastify({ logger: true });
 
+// CORS Preflight & Headers hook for web and desktop app clients
+app.addHook("onRequest", async (request, reply) => {
+  reply.header("Access-Control-Allow-Origin", "*");
+  reply.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
+  reply.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Origin, Accept");
+  if (request.method === "OPTIONS") {
+    return reply.status(204).send();
+  }
+});
+
 // Connected daemons, keyed by device ID
 const daemons = new Map<string, WebSocket>();
+
+// Endpoint to register/sync sessions into Neon PostgreSQL
+app.post("/sessions", async (request, reply) => {
+  const { id, deviceId, status } = (request.body ?? {}) as {
+    id?: string;
+    deviceId?: string;
+    status?: string;
+  };
+
+  let dId = deviceId;
+  if (!dId) {
+    const dRes = await pool.query("select id from devices order by created_at desc limit 1");
+    dId = dRes.rows[0]?.id;
+  }
+  if (!dId) {
+    const uRes = await pool.query("select id from users order by created_at desc limit 1");
+    let uId = uRes.rows[0]?.id;
+    if (!uId) {
+      const u = await pool.query("insert into users (github_id, github_login) values ('default', 'developer') returning id");
+      uId = u.rows[0].id;
+    }
+    const d = await pool.query("insert into devices (user_id, name) values ($1, 'desktop-client') returning id", [uId]);
+    dId = d.rows[0].id;
+  }
+
+  const result = await pool.query(
+    `insert into sessions (id, device_id, status)
+     values (coalesce($1, gen_random_uuid()), $2, coalesce($3, 'running'))
+     on conflict (id) do update set status = excluded.status
+     returning id, device_id, status, created_at`,
+    [id, dId, status ?? "running"]
+  );
+
+  return result.rows[0];
+});
+
+app.get("/sessions", async () => {
+  const result = await pool.query("select * from sessions order by created_at desc limit 100");
+  return { sessions: result.rows };
+});
 
 app.get("/health", async () => {
   const result = await pool.query("select now() as db_time");
