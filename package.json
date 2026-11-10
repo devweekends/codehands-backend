@@ -11,7 +11,8 @@
     "migrate": "tsx src/migrate.ts",
     "daemon": "tsx src/daemon.ts",
     "mock": "tsx mock/server.ts",
-    "test": "tsx --test test/guard.test.ts"
+    "test": "tsx --test test/guard.test.ts test/model-registry.test.ts test/model-preferences.test.ts test/model-router.test.ts test/sync-preferences.test.ts test/cost-ledger.test.ts test/two-laptop-sync.test.ts",
+    "demo:sync": "tsx src/sync-demo.ts"
   },
   "keywords": [],
   "author": "",
@@ -21,7 +22,8 @@
     "dotenv": "^18.0.8",
     "fastify": "^5.12.7",
     "pg": "^8.23.1",
-    "ws": "^8.22.0"
+    "ws": "^8.22.0",
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

@@ -1,0 +1,47 @@
+models:
+  - id: claude-opus-5-5
+    provider: anthropic
+    pricing:
+      input_per_million: 4.00
+      output_per_million: 20.00
+      cache_read_per_million: 0.20
+      cache_write_5m_per_million: 5.00
+      cache_write_1h_per_million: 8.00
+    context_size: 1000000
+    capabilities:
+      - reasoning
+      - coding
+      - analysis
+      - vision
+      - computer_use
+    pricing_source: https://platform.claude.com/docs/en/about-claude/pricing
+    pricing_verified_at: "2026-11-08"
+
+  - id: claude-sonnet-5-5
+    provider: anthropic
+    pricing:
+      input_per_million: 3.00
+      output_per_million: 15.00
+      cache_read_per_million: 0.30
+      cache_write_5m_per_million: 3.75
+      cache_write_1h_per_million: 6.00
+    context_size: 200000
+    capabilities:
+      - coding
+      - analysis
+    pricing_source: https://platform.claude.com/docs/en/about-claude/pricing
+    pricing_verified_at: "2026-11-08"
+
+  - id: claude-haiku-4-5
+    provider: anthropic
+    pricing:
+      input_per_million: 1.00
+      output_per_million: 5.00
+      cache_read_per_million: 0.10
+      cache_write_5m_per_million: 1.25
+      cache_write_1h_per_million: 2.00
+    context_size: 200000
+    capabilities:
+      - coding
+    pricing_source: https://platform.claude.com/docs/en/about-claude/pricing
+    pricing_verified_at: "2026-11-08"
