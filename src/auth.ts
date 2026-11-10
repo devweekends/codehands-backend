@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import type pg from "pg";
 
@@ -38,131 +38,29 @@ export function requireAuth(pool: pg.Pool) {
 
 
 // Ask GitHub who this code belongs to. The GitHub token is never stored.
+async function githubUser(code: string) {
+  const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({
+      client_id: process.env.GITHUB_CLIENT_ID,
+      client_secret: process.env.GITHUB_CLIENT_SECRET,
+      code,
+    }),
+  });
+  const tokenJson = (await tokenRes.json()) as { access_token?: string };
+  if (!tokenJson.access_token) return null;
 
-type GithubUser = {
-  id: string;
-  login: string;
-};
-
-class GithubInvalidCodeError extends Error {
-  constructor() {
-    super("GitHub authorization code is invalid or expired");
-    this.name = "GithubInvalidCodeError";
-  }
-}
-
-class GithubServiceError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "GithubServiceError";
-  }
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-// Ask GitHub who this code belongs to.
-async function githubUser(
-  code: string,
-  fetchImpl: typeof fetch = fetch
-): Promise<GithubUser> {
-  let tokenRes: Response;
-
-  try {
-    tokenRes = await fetchImpl(
-      "https://github.com/login/oauth/access_token",
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          accept: "application/json",
-        },
-        body: JSON.stringify({
-          client_id: process.env.GITHUB_CLIENT_ID,
-          client_secret: process.env.GITHUB_CLIENT_SECRET,
-          code,
-        }),
-        signal: AbortSignal.timeout(10_000),
-      }
-    );
-  } catch {
-    throw new GithubServiceError("GitHub OAuth request failed");
-  }
-
-  let tokenJson: unknown;
-
-  try {
-    tokenJson = await tokenRes.json();
-  } catch {
-    throw new GithubServiceError("Invalid response from GitHub OAuth");
-  }
-
-  if (
-    isObject(tokenJson) &&
-    tokenJson.error === "bad_verification_code"
-  ) {
-    throw new GithubInvalidCodeError();
-  }
-
-  if (!tokenRes.ok) {
-    throw new GithubServiceError(
-      `GitHub OAuth returned status ${tokenRes.status}`
-    );
-  }
-
-  if (
-    !isObject(tokenJson) ||
-    typeof tokenJson.access_token !== "string" ||
-    !tokenJson.access_token
-  ) {
-    throw new GithubServiceError("GitHub did not return an access token");
-  }
-
-  let userRes: Response;
-
-  try {
-    userRes = await fetchImpl("https://api.github.com/user", {
-      headers: {
-        authorization: `Bearer ${tokenJson.access_token}`,
-        accept: "application/vnd.github+json",
-        "user-agent": "codehands-backend",
-      },
-      signal: AbortSignal.timeout(10_000),
-    });
-  } catch {
-    throw new GithubServiceError("GitHub user request failed");
-  }
-
-  if (!userRes.ok) {
-    throw new GithubServiceError(
-      `GitHub user API returned status ${userRes.status}`
-    );
-  }
-
-  let userJson: unknown;
-
-  try {
-    userJson = await userRes.json();
-  } catch {
-    throw new GithubServiceError("Invalid GitHub user response");
-  }
-
-  if (
-    !isObject(userJson) ||
-    typeof userJson.id !== "number" ||
-    !Number.isSafeInteger(userJson.id) ||
-    userJson.id <= 0 ||
-    typeof userJson.login !== "string" ||
-    !userJson.login.trim()
-  ) {
-    throw new GithubServiceError("GitHub returned invalid user information");
-  }
-
-  return {
-    id: String(userJson.id),
-    login: userJson.login,
-  };
+  const userRes = await fetch("https://api.github.com/user", {
+    headers: {
+      authorization: `Bearer ${tokenJson.access_token}`,
+      accept: "application/vnd.github+json",
+      "user-agent": "codehands-backend",
+    },
+  });
+  if (!userRes.ok) return null;
+  const u = (await userRes.json()) as { id: number; login: string };
+  return { id: String(u.id), login: u.login };
 }
 
 
