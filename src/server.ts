@@ -11,11 +11,14 @@ app.setErrorHandler((error, request, reply) => {
   const code = (error as Error & { code?: string }).code;
   request.log.error(error);
 
-  if (["ECONNREFUSED", "ENOTFOUND", "ECONNRESET", "08000", "08003", "08006", "3D000"].includes(code ?? "")) {
+  if (
+    ["ECONNREFUSED", "ENOTFOUND", "ECONNRESET", "08000", "08003", "08006", "3D000"].includes(code ?? "")
+  ) {
     return reply.code(503).send({
       error: "Auth database is unavailable. Configure DATABASE_URL and make sure PostgreSQL is running.",
     });
   }
+
   if (["42P01", "42703"].includes(code ?? "")) {
     return reply.code(503).send({
       error: "Auth database schema is outdated. Run the backend migration, then restart the API.",
@@ -30,18 +33,29 @@ const allowedDesktopOrigins = new Set([
   "http://127.0.0.1:1420",
   "http://tauri.localhost",
   "tauri://localhost",
-  ...(process.env.DESKTOP_ORIGINS ?? "").split(",").map((origin) => origin.trim()).filter(Boolean),
+  ...(process.env.DESKTOP_ORIGINS ?? "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean),
 ]);
 
-// Tauri's WebView sends an OPTIONS preflight for JSON auth requests.
+// CORS for web and desktop app clients
 app.addHook("onRequest", async (request, reply) => {
   const origin = request.headers.origin;
+
   if (origin && allowedDesktopOrigins.has(origin)) {
     reply.header("Access-Control-Allow-Origin", origin);
     reply.header("Vary", "Origin");
-    reply.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    reply.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    reply.header(
+      "Access-Control-Allow-Methods",
+      "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+    );
+    reply.header(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-Requested-With, Origin, Accept"
+    );
   }
+
   if (request.method === "OPTIONS") {
     return reply.code(204).send();
   }
@@ -49,6 +63,46 @@ app.addHook("onRequest", async (request, reply) => {
 
 // Connected daemons, keyed by device ID
 const daemons = new Map<string, WebSocket>();
+
+// Endpoint to register/sync sessions into Neon PostgreSQL
+app.post("/sessions", async (request, reply) => {
+  const { id, deviceId, status } = (request.body ?? {}) as {
+    id?: string;
+    deviceId?: string;
+    status?: string;
+  };
+
+  let dId = deviceId;
+  if (!dId) {
+    const dRes = await pool.query("select id from devices order by created_at desc limit 1");
+    dId = dRes.rows[0]?.id;
+  }
+  if (!dId) {
+    const uRes = await pool.query("select id from users order by created_at desc limit 1");
+    let uId = uRes.rows[0]?.id;
+    if (!uId) {
+      const u = await pool.query("insert into users (github_id, github_login) values ('default', 'developer') returning id");
+      uId = u.rows[0].id;
+    }
+    const d = await pool.query("insert into devices (user_id, name) values ($1, 'desktop-client') returning id", [uId]);
+    dId = d.rows[0].id;
+  }
+
+  const result = await pool.query(
+    `insert into sessions (id, device_id, status)
+     values (coalesce($1, gen_random_uuid()), $2, coalesce($3, 'running'))
+     on conflict (id) do update set status = excluded.status
+     returning id, device_id, status, created_at`,
+    [id, dId, status ?? "running"]
+  );
+
+  return result.rows[0];
+});
+
+app.get("/sessions", async () => {
+  const result = await pool.query("select * from sessions order by created_at desc limit 100");
+  return { sessions: result.rows };
+});
 
 app.get("/health", async () => {
   const result = await pool.query("select now() as db_time");

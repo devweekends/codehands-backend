@@ -1,9 +1,18 @@
-﻿import { randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { openDb } from "./db.js";
-import { canTransition, type SessionStatus } from "../../../codehands-contracts/src/session.ts";
+
+import {
+  canTransition,
+  type SessionStatus,
+} from "../../../codehands-contracts/src/session.ts";
+
 import type { RunnerEvent } from "../../../codehands-contracts/src/runner.ts";
-import { createFakeRunner, createRunner } from "../../../codehands-agent/runner/src/index.ts";
+
+import {
+  createFakeRunner,
+  createRunner,
+} from "../../../codehands-agent/runner/src/index.ts";
 
 const db = openDb();
 const useFakeRunner = process.env.CODEHANDS_FAKE === "true";
