@@ -7,6 +7,46 @@ import { syncRoutes } from "./sync.js";
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const app = Fastify({ logger: true });
 
+app.setErrorHandler((error, request, reply) => {
+  const code = (error as Error & { code?: string }).code;
+  request.log.error(error);
+
+  if (["ECONNREFUSED", "ENOTFOUND", "ECONNRESET", "08000", "08003", "08006", "3D000"].includes(code ?? "")) {
+    return reply.code(503).send({
+      error: "Auth database is unavailable. Configure DATABASE_URL and make sure PostgreSQL is running.",
+    });
+  }
+  if (["42P01", "42703"].includes(code ?? "")) {
+    return reply.code(503).send({
+      error: "Auth database schema is outdated. Run the backend migration, then restart the API.",
+    });
+  }
+
+  return reply.code(500).send({ error: "Internal Server Error" });
+});
+
+const allowedDesktopOrigins = new Set([
+  "http://localhost:1420",
+  "http://127.0.0.1:1420",
+  "http://tauri.localhost",
+  "tauri://localhost",
+  ...(process.env.DESKTOP_ORIGINS ?? "").split(",").map((origin) => origin.trim()).filter(Boolean),
+]);
+
+// Tauri's WebView sends an OPTIONS preflight for JSON auth requests.
+app.addHook("onRequest", async (request, reply) => {
+  const origin = request.headers.origin;
+  if (origin && allowedDesktopOrigins.has(origin)) {
+    reply.header("Access-Control-Allow-Origin", origin);
+    reply.header("Vary", "Origin");
+    reply.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    reply.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  }
+  if (request.method === "OPTIONS") {
+    return reply.code(204).send();
+  }
+});
+
 // Connected daemons, keyed by device ID
 const daemons = new Map<string, WebSocket>();
 
