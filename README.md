@@ -135,10 +135,10 @@ You need Node 22 and a Postgres 13 or newer (for `gen_random_uuid()`), local or 
 npm install
 ```
 
-Create `.env` in the repo root. It is git-ignored.
+Create `.env` in the repo root from `.env.example`. It is git-ignored. Put the rotated Neon connection string in `DATABASE_URL`; never commit or share the file.
 
 ```bash
-DATABASE_URL=postgres://user:password@localhost:5432/codehands
+DATABASE_URL=postgresql://user:password@host/database?sslmode=require
 PORT=3000
 DEV_TOKEN=pick-a-long-random-string     # shared secret between server and daemon
 
@@ -147,21 +147,21 @@ SERVER_URL=ws://localhost:3000/ws
 DEVICE_ID=                              # filled in below
 ```
 
-Create the tables, then a user and a device by hand (there is no sign-up yet):
+Apply the current schema to the selected database/Neon branch before starting the API:
 
 ```bash
 npm run migrate
-psql "$DATABASE_URL" -c "
-  with u as (insert into users (github_id, github_login) values ('0', 'dev') returning id)
-  insert into devices (user_id, name) select id, 'my-laptop' from u returning id;"
 ```
 
-Put the returned id in `DEVICE_ID`. Then, in two terminals:
+Then start the API from this repository in its own terminal:
 
 ```bash
-npm run dev       # server, restarts on change
-npm run daemon    # or: npx codehands start, from the repo root
+npm run dev
 ```
+
+For the desktop app, set `VITE_CLOUD_URL=http://localhost:3000` in the desktop repo's ignored `.env`, then restart Vite/Tauri. Check `http://localhost:3000/health` before signing in; it must return `ok: true`. The local API connects to Postgres using `DATABASE_URL`; the desktop app never connects directly to Neon. Confirm the Neon project and branch with the team before running migrations against a shared database.
+
+The legacy daemon relay instructions below still use `DEV_TOKEN` and `DEVICE_ID`; those values are not needed for email/password desktop authentication.
 
 Send a command and watch both terminals:
 
