@@ -16,7 +16,6 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "@codehands/runner": "file:../codehands-agent/runner",
     "better-sqlite3": "^13.0.3"
   },
   "devDependencies": {

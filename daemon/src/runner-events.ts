@@ -1,6 +1,6 @@
-
+﻿
 import { openDb } from "./db.js";
-import type { RunnerEvent } from "../../codehands-contracts/src/runner.ts";
+import type { RunnerEvent } from "../../../codehands-contracts/src/runner.ts";
 
 export function saveRunnerEvent(runnerEvent: RunnerEvent): number {
   const db = openDb();
@@ -38,3 +38,4 @@ export function saveRunnerEvent(runnerEvent: RunnerEvent): number {
     db.close();
   }
 }
+

@@ -1,6 +1,5 @@
-
-import { openDb } from "./db.js";
-import type { StartOptions } from "../../codehands-contracts/src/runner.ts";
+﻿import { openDb } from "./db.js";
+import type { StartOptions } from "../../../codehands-contracts/src/runner.ts";
 
 type StartOptionsRow = {
   session_id: string;
@@ -47,7 +46,9 @@ export function buildStartOptions(
       repoPath: row.repo_path,
       prompt: row.prompt,
       agent: row.agent,
-      model: row.model,
+      // An empty model means "unset": leave it out so the runner
+      // does not receive --model with a placeholder value.
+      ...(row.model ? { model: row.model } : {}),
     };
   } finally {
     db.close();

@@ -3,25 +3,30 @@ import { openDb } from "./db.js";
 import {
   canTransition,
   type SessionStatus,
-} from "../../codehands-contracts/src/session.ts";
+} from "../../../codehands-contracts/src/session.ts";
 import type {
   Runner,
   RunnerEvent,
-} from "../../codehands-contracts/src/runner.ts";
+} from "../../../codehands-contracts/src/runner.ts";
+import {
+  createFakeRunner,
+  createRunner,
+} from "../../../codehands-agent/runner/src/index.ts";
 import {
   checkProvider,
   getActiveProviderLimit,
 } from "./preflight.js";
-import { createFakeRunner } from "@codehands/runner";
 import { buildStartOptions } from "./start-options.js";
 import { saveRunnerEvent } from "./runner-events.js";
 
 const db = openDb();
 const NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 
-const fakeMode = process.env.CODEHANDS_FAKE_RUNNER === "1";
-// Only the fake runner is enabled until real provider commands are verified.
-const runner: Runner = createFakeRunner({ delayMs: 300 });
+// CODEHANDS_FAKE=true selects the fake runner, otherwise the real one.
+const fakeMode = process.env.CODEHANDS_FAKE === "true";
+const runner: Runner = fakeMode
+  ? createFakeRunner({ delayMs: 300 })
+  : createRunner();
 
 const activeRuns = new Set<string>();
 
@@ -126,6 +131,23 @@ function transitionIfAllowed(
   return true;
 }
 
+// Contract v0.2.0 provider states -> states allowed by provider_status.
+function providerStateToDb(state: unknown): string | null {
+  switch (state) {
+    case "rate_limited":
+      return "rate_limited";
+    case "usage_limit":
+    case "subscription_inactive":
+      return "usage_limited";
+    case "auth_expired":
+      return "not_logged_in";
+    case "down":
+      return "outage";
+    default:
+      return null;
+  }
+}
+
 async function consumeRunnerEvents(
   sessionId: string,
   stream: AsyncIterable<RunnerEvent>
@@ -148,42 +170,30 @@ async function consumeRunnerEvents(
     );
 
     if (runnerEvent.type === "provider.status") {
+      // Contract v0.2.0: { state, message, code?, retryAt? }.
+      // The payload has no agent, so take it from the session.
       const payload = runnerEvent.payload;
+      const state = providerStateToDb(payload.state);
+      const session = db.prepare(`
+        SELECT agent FROM sessions WHERE id = ?
+      `).get(sessionId) as { agent: string } | undefined;
 
-      if (
-        (payload.agent === "codex" ||
-          payload.agent === "claude-code") &&
-        (
-          payload.state === "ok" ||
-          payload.state === "not_installed" ||
-          payload.state === "not_logged_in" ||
-          payload.state === "rate_limited" ||
-          payload.state === "usage_limited" ||
-          payload.state === "outage"
-        )
-      ) {
+      if (state && session && isSupportedAgent(session.agent)) {
         db.prepare(`
           INSERT INTO provider_status (
             agent, state, reason, retry_at, checked_at
           )
-          VALUES (
-            ?, ?, ?, ?,
-            strftime('%Y-%m-%dT%H:%M:%fZ','now')
-          )
+          VALUES (?, ?, ?, ?, ${NOW})
           ON CONFLICT(agent) DO UPDATE SET
             state = excluded.state,
             reason = excluded.reason,
             retry_at = excluded.retry_at,
             checked_at = excluded.checked_at
         `).run(
-          payload.agent,
-          payload.state,
-          typeof payload.reason === "string"
-            ? payload.reason
-            : null,
-          typeof payload.retry_at === "string"
-            ? payload.retry_at
-            : null
+          session.agent,
+          state,
+          typeof payload.message === "string" ? payload.message : null,
+          typeof payload.retryAt === "string" ? payload.retryAt : null
         );
       }
     }
@@ -205,7 +215,7 @@ async function consumeRunnerEvents(
     }
 
     if (runnerEvent.type === "task.finished") {
-      // Tahira's runner emits approval.requested after task.finished.
+      // The runner emits approval.requested after task.finished.
       // Keep the session running until the approval event arrives.
       console.log("Runner finished work; waiting for approval:", sessionId);
     }
@@ -310,7 +320,7 @@ function claimTasks(): void {
         const model =
           models.implement ??
           Object.values(models)[0] ??
-          "unspecified";
+          ""; // empty means unset (sessions.model is NOT NULL)
 
         const sessionId = randomUUID();
 
@@ -376,14 +386,9 @@ function claimTasks(): void {
         return sessionId;
       })();
 
-      if (claimedSessionId && fakeMode) {
+      if (claimedSessionId) {
         // Start outside the SQLite transaction.
-        transition(
-          claimedSessionId,
-          "queued",
-          "running"
-        );
-
+        transition(claimedSessionId, "queued", "running");
         void runSession(claimedSessionId);
       }
     } catch (error) {
@@ -433,8 +438,6 @@ async function processCommands(): Promise<void> {
 
         if (!session) {
           reason = "Session not found";
-        } else if (!fakeMode) {
-          reason = "Real runner is not connected yet";
         } else {
           switch (command.kind) {
             case "stop": {
@@ -475,7 +478,7 @@ async function processCommands(): Promise<void> {
 
               const result = await runner.approve(
                 session.id,
-                "Approved by user"
+                ""
               );
 
               db.prepare(`
@@ -572,7 +575,7 @@ async function main(): Promise<void> {
   console.log("CodeHands watcher starting...");
   console.log(
     "Runner mode:",
-    fakeMode ? "FAKE" : "REAL (not connected)"
+    fakeMode ? "FAKE" : "REAL"
   );
 
   recoverSessions();

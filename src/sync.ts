@@ -2,6 +2,9 @@ import type { FastifyInstance } from "fastify";
 import type pg from "pg";
 import { requireAuth } from "./auth.js";
 import { checkData } from "./guard.js";
+import { loadModelRegistry } from "./models/model-registry.js";
+import { validateModelPreferences } from "./models/model-preferences.js";
+import type { ModelRegistry } from "./models/model.types.js";
 
 const KINDS = ["project", "session", "event", "memory", "preference"];
 const MAX_BATCH = 500;
@@ -15,9 +18,13 @@ type Change = {
   data?: Record<string, unknown>;
 };
 
-export async function syncRoutes(app: FastifyInstance, opts: { pool: pg.Pool }) {
+export async function syncRoutes(
+  app: FastifyInstance,
+  opts: { pool: pg.Pool; registry?: ModelRegistry },
+) {
   const { pool } = opts;
   const auth = requireAuth(pool);
+  const registry = opts.registry ?? (await loadModelRegistry());
 
   app.post("/sync/push", { preHandler: auth }, async (req, reply) => {
     const { changes } = (req.body ?? {}) as { changes?: Change[] };
@@ -42,6 +49,20 @@ export async function syncRoutes(app: FastifyInstance, opts: { pool: pg.Pool }) 
         rejected.push({ id: c.id, reason: bad });
         continue;
       }
+
+      if (
+        !c.deleted &&
+        c.kind === "preference" &&
+        (c.id === "model-preferences" || (c.data && "modelPerPhase" in c.data))
+      ) {
+        try {
+          validateModelPreferences(c.data, registry);
+        } catch (err) {
+          rejected.push({ id: c.id, reason: (err as Error).message });
+          continue;
+        }
+      }
+
       const data = JSON.stringify(c.data ?? {});
 
       if (c.kind === "event") {

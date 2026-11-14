@@ -1,9 +1,22 @@
 create table if not exists users (
   id uuid primary key default gen_random_uuid(),
-  github_id text unique not null,
-  github_login text not null,
+  github_id text unique,
+  github_login text,
+  name text,
+  email text,
+  password_hash text,
   created_at timestamptz not null default now()
 );
+
+-- Upgrade existing GitHub-only users for email/password accounts.
+alter table users add column if not exists name text;
+alter table users add column if not exists email text;
+alter table users add column if not exists password_hash text;
+alter table users alter column github_id drop not null;
+alter table users alter column github_login drop not null;
+update users set name = github_login where name is null and github_login is not null;
+create unique index if not exists users_email_unique_idx
+  on users (lower(email)) where email is not null;
 
 create table if not exists devices (
   id uuid primary key default gen_random_uuid(),
