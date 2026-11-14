@@ -1,29 +1,40 @@
-import { randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
+﻿import { randomUUID } from "node:crypto";
 import { openDb } from "./db.js";
-
 import {
   canTransition,
   type SessionStatus,
 } from "../../../codehands-contracts/src/session.ts";
-
-import type { RunnerEvent } from "../../../codehands-contracts/src/runner.ts";
-
+import type {
+  Runner,
+  RunnerEvent,
+} from "../../../codehands-contracts/src/runner.ts";
 import {
   createFakeRunner,
   createRunner,
 } from "../../../codehands-agent/runner/src/index.ts";
+import {
+  checkProvider,
+  getActiveProviderLimit,
+} from "./preflight.js";
+import { buildStartOptions } from "./start-options.js";
+import { saveRunnerEvent } from "./runner-events.js";
 
 const db = openDb();
-const useFakeRunner = process.env.CODEHANDS_FAKE === "true";
-const runner = useFakeRunner ? createFakeRunner() : createRunner();
 const NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
+
+// CODEHANDS_FAKE=true selects the fake runner, otherwise the real one.
+const fakeMode = process.env.CODEHANDS_FAKE === "true";
+const runner: Runner = fakeMode
+  ? createFakeRunner({ delayMs: 300 })
+  : createRunner();
+
+const activeRuns = new Set<string>();
+
+type Agent = "codex" | "claude-code";
 
 type Task = {
   id: string;
   project_id: string;
-  prompt: string;
-  repo_path: string;
   agent: string;
   models: string;
 };
@@ -39,16 +50,38 @@ type Command = {
   kind: string;
 };
 
-const activeRuns = new Set<string>();
+function isSupportedAgent(agent: string): agent is Agent {
+  return agent === "codex" || agent === "claude-code";
+}
 
-function event(sessionId: string, type: string, payload: object = {}, seq?: number) {
-  const row = db.prepare(
-    "select coalesce(max(seq), 0) + 1 as seq from events where session_id = ?"
-  ).get(sessionId) as { seq: number };
+function event(
+  sessionId: string,
+  type: string,
+  payload: object = {}
+): void {
+  const row = db.prepare(`
+    SELECT COALESCE(MAX(seq), 0) + 1 AS seq
+    FROM events
+    WHERE session_id = ?
+  `).get(sessionId) as { seq: number };
 
-  db.prepare(
-    "insert into events (session_id, seq, type, payload) values (?, ?, ?, ?)"
-  ).run(sessionId, seq ?? row.seq, type, JSON.stringify(payload));
+  db.prepare(`
+    INSERT INTO events (session_id, seq, type, payload)
+    VALUES (?, ?, ?, ?)
+  `).run(
+    sessionId,
+    row.seq,
+    type,
+    JSON.stringify(payload)
+  );
+}
+
+function getSession(sessionId: string): Session | undefined {
+  return db.prepare(`
+    SELECT id, status
+    FROM sessions
+    WHERE id = ?
+  `).get(sessionId) as Session | undefined;
 }
 
 function transition(
@@ -56,251 +89,495 @@ function transition(
   from: SessionStatus,
   to: SessionStatus,
   reason: string | null = null
-) {
+): void {
   if (!canTransition(from, to)) {
     throw new Error(`Illegal transition: ${from} -> ${to}`);
   }
 
-  const result = db.prepare(
-    `update sessions
-     set status = ?, reason = ?, updated_at = ${NOW}
-     where id = ? and status = ?`
-  ).run(to, reason, sessionId, from);
+  const result = db.prepare(`
+    UPDATE sessions
+    SET status = ?,
+        reason = ?,
+        updated_at = ${NOW}
+    WHERE id = ?
+      AND status = ?
+  `).run(to, reason, sessionId, from);
 
   if (result.changes !== 1) {
-    throw new Error("Session status changed concurrently");
+    throw new Error(
+      `Session status changed concurrently: ${sessionId}`
+    );
   }
+
+  event(sessionId, "session.status_changed", {
+    from,
+    to,
+    reason,
+  });
 }
 
-function setStatus(sessionId: string, to: SessionStatus, reason: string | null = null) {
-  const session = db.prepare("select id, status from sessions where id = ?").get(sessionId) as Session | undefined;
-  if (!session || session.status === to) return;
+function transitionIfAllowed(
+  sessionId: string,
+  to: SessionStatus,
+  reason: string | null = null
+): boolean {
+  const session = getSession(sessionId);
+
+  if (!session || !canTransition(session.status, to)) {
+    return false;
+  }
+
   transition(sessionId, session.status, to, reason);
+  return true;
 }
 
-async function persistRunnerEvent(runnerEvent: RunnerEvent) {
-  const { sessionId, type, payload, seq } = runnerEvent;
-  event(sessionId, type, payload, seq);
-  if (type === "task.started") setStatus(sessionId, "running");
-  if (type === "approval.requested") {
-    setStatus(sessionId, "awaiting_approval");
-    const diff = await runner.diff(sessionId);
-    db.prepare(`update sessions set diff = ?, updated_at = ${NOW} where id = ?`)
-      .run(diff.patch, sessionId);
-  }
-  if (type === "task.failed") {
-    const reason = String(payload.reason ?? payload.result ?? "Runner failed");
-    setStatus(sessionId, "failed", reason);
-  }
-  if (type === "task.stopped") setStatus(sessionId, "stopped");
-  if (type === "task.finished" && typeof payload.costUsd === "number") {
-    db.prepare(`update sessions set cost_usd = ?, updated_at = ${NOW} where id = ?`)
-      .run(payload.costUsd, sessionId);
+// Contract v0.2.0 provider states -> states allowed by provider_status.
+function providerStateToDb(state: unknown): string | null {
+  switch (state) {
+    case "rate_limited":
+      return "rate_limited";
+    case "usage_limit":
+    case "subscription_inactive":
+      return "usage_limited";
+    case "auth_expired":
+      return "not_logged_in";
+    case "down":
+      return "outage";
+    default:
+      return null;
   }
 }
 
-async function runSession(task: Task, sessionId: string, resumePrompt?: string) {
-  if (activeRuns.has(sessionId)) return;
+async function consumeRunnerEvents(
+  sessionId: string,
+  stream: AsyncIterable<RunnerEvent>
+): Promise<void> {
+  for await (const runnerEvent of stream) {
+    if (runnerEvent.sessionId !== sessionId) {
+      throw new Error(
+        `Runner event session mismatch: ${runnerEvent.sessionId}`
+      );
+    }
+
+    const dbSeq = saveRunnerEvent(runnerEvent);
+
+    console.log(
+      "Runner event:",
+      sessionId.slice(0, 8),
+      runnerEvent.type,
+      "DB seq:",
+      dbSeq
+    );
+
+    if (runnerEvent.type === "provider.status") {
+      // Contract v0.2.0: { state, message, code?, retryAt? }.
+      // The payload has no agent, so take it from the session.
+      const payload = runnerEvent.payload;
+      const state = providerStateToDb(payload.state);
+      const session = db.prepare(`
+        SELECT agent FROM sessions WHERE id = ?
+      `).get(sessionId) as { agent: string } | undefined;
+
+      if (state && session && isSupportedAgent(session.agent)) {
+        db.prepare(`
+          INSERT INTO provider_status (
+            agent, state, reason, retry_at, checked_at
+          )
+          VALUES (?, ?, ?, ?, ${NOW})
+          ON CONFLICT(agent) DO UPDATE SET
+            state = excluded.state,
+            reason = excluded.reason,
+            retry_at = excluded.retry_at,
+            checked_at = excluded.checked_at
+        `).run(
+          session.agent,
+          state,
+          typeof payload.message === "string" ? payload.message : null,
+          typeof payload.retryAt === "string" ? payload.retryAt : null
+        );
+      }
+    }
+
+    if (runnerEvent.type === "approval.requested") {
+      const changed = transitionIfAllowed(sessionId, "awaiting_approval");
+      console.log("Approval transition:", changed ? "SUCCESS" : "FAILED", sessionId);
+    }
+
+    if (runnerEvent.type === "task.failed") {
+      const reason = typeof runnerEvent.payload.reason === "string"
+        ? runnerEvent.payload.reason
+        : "Runner failed";
+      transitionIfAllowed(sessionId, "failed", reason);
+    }
+
+    if (runnerEvent.type === "task.stopped") {
+      transitionIfAllowed(sessionId, "stopped");
+    }
+
+    if (runnerEvent.type === "task.finished") {
+      // The runner emits approval.requested after task.finished.
+      // Keep the session running until the approval event arrives.
+      console.log("Runner finished work; waiting for approval:", sessionId);
+    }
+  }
+}
+
+async function runSession(
+  sessionId: string,
+  resume = false
+): Promise<void> {
+  if (activeRuns.has(sessionId)) {
+    console.log("Session already running:", sessionId);
+    return;
+  }
+
   activeRuns.add(sessionId);
+
   try {
-    if (task.agent !== "claude-code" && task.agent !== "codex") {
-      throw new Error(`The runner does not support ${task.agent} yet.`);
-    }
-    if (task.agent === "codex") {
-      throw new Error("Codex runner support is not available yet; choose Claude Code.");
-    }
-    const cliCheck = spawnSync("claude", ["--version"], { encoding: "utf8", windowsHide: true });
-    if (cliCheck.error?.code === "ENOENT") {
-      throw new Error("Claude Code CLI was not found on PATH. Install Claude Code, sign in with `claude`, and restart Code Hands.");
-    }
-    const models = JSON.parse(task.models || "{}") as Record<string, string>;
-    const model = String(models.implement ?? Object.values(models)[0] ?? "sonnet");
-    const stream = resumePrompt === undefined
-      ? runner.start({
-          sessionId,
-          repoPath: task.repo_path,
-          prompt: task.prompt,
-          agent: "claude-code",
-          model,
-          budgetUsd: 0.5,
-        })
-      : runner.resume(sessionId, resumePrompt);
-    for await (const runnerEvent of stream) await persistRunnerEvent(runnerEvent);
+    const stream = resume
+      ? runner.resume(sessionId)
+      : runner.start(buildStartOptions(sessionId));
+
+    await consumeRunnerEvents(sessionId, stream);
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    setStatus(sessionId, "failed", reason);
-    event(sessionId, "task.failed", { reason });
-    console.error("Runner failed for session", sessionId, reason);
+    console.error("Runner failed:", sessionId, error);
+
+    const reason =
+      error instanceof Error
+        ? error.message
+        : String(error);
+
+    transitionIfAllowed(sessionId, "failed", reason);
   } finally {
     activeRuns.delete(sessionId);
   }
 }
 
-function claimTasks() {
-  const tasks = db.prepare(
-    `select t.id, t.project_id, t.prompt, t.agent, t.models, p.path as repo_path
-     from tasks t
-     join projects p on p.id = t.project_id
-     where not exists (
-       select 1 from sessions s where s.task_id = t.id
-     )
-     order by t.created_at`
-  ).all() as Task[];
+function claimTasks(): void {
+  const tasks = db.prepare(`
+    SELECT t.id, t.project_id, t.agent, t.models
+    FROM tasks t
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM sessions s
+      WHERE s.task_id = t.id
+    )
+    ORDER BY t.created_at
+  `).all() as Task[];
 
   for (const task of tasks) {
-    db.transaction(() => {
-      const models = JSON.parse(task.models || "{}");
-      const model =
-        models.implement ??
-        Object.values(models)[0] ??
-        "unspecified";
+    try {
+      let providerState: string;
+      let providerReason: string | null = null;
+      let retryAt: string | null = null;
 
-      const sessionId = randomUUID();
+      if (!isSupportedAgent(task.agent)) {
+        providerState = "not_installed";
+        providerReason = `Unsupported agent: ${task.agent}`;
+      } else if (fakeMode) {
+        providerState = "ok";
+      } else {
+        const activeLimit = getActiveProviderLimit(task.agent);
 
-      const result = db.prepare(
-        `insert or ignore into sessions
-         (id, task_id, project_id, agent, model, status)
-         values (?, ?, ?, ?, ?, 'queued')`
-      ).run(
-        sessionId,
-        task.id,
-        task.project_id,
-        task.agent,
-        String(model)
-      );
-
-      if (result.changes === 1) {
-        console.log("Claimed task:", task.id.slice(0, 8));
-        void runSession(task, sessionId);
+        if (activeLimit) {
+          providerState = activeLimit.state;
+          providerReason = activeLimit.reason;
+          retryAt = activeLimit.retry_at;
+        } else {
+          const provider = checkProvider(task.agent);
+          providerState = provider.state;
+          providerReason = provider.reason;
+          retryAt = provider.retry_at;
+        }
       }
-    })();
-  }
 
-  // Queued rows can survive a daemon restart before the runner was launched.
-  const queued = db.prepare(
-    `select s.id as session_id, t.id, t.project_id, t.prompt, t.agent, t.models, p.path as repo_path
-     from sessions s join tasks t on t.id = s.task_id
-     join projects p on p.id = t.project_id where s.status = 'queued'`
-  ).all() as (Task & { session_id: string })[];
-  for (const task of queued) void runSession(task, task.session_id);
+      const claimedSessionId = db.transaction((): string | null => {
+        if (isSupportedAgent(task.agent) && !fakeMode) {
+          db.prepare(`
+            INSERT INTO provider_status (
+              agent, state, reason, retry_at, checked_at
+            )
+            VALUES (
+              ?, ?, ?, ?,
+              strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            )
+            ON CONFLICT(agent) DO UPDATE SET
+              state = excluded.state,
+              reason = excluded.reason,
+              retry_at = excluded.retry_at,
+              checked_at = excluded.checked_at
+          `).run(
+            task.agent,
+            providerState,
+            providerReason,
+            retryAt
+          );
+        }
+
+        const models = JSON.parse(task.models || "{}") as
+          Record<string, unknown>;
+
+        const model =
+          models.implement ??
+          Object.values(models)[0] ??
+          ""; // empty means unset (sessions.model is NOT NULL)
+
+        const sessionId = randomUUID();
+
+        const result = db.prepare(`
+          INSERT OR IGNORE INTO sessions (
+            id, task_id, project_id, agent, model, status
+          )
+          VALUES (?, ?, ?, ?, ?, 'queued')
+        `).run(
+          sessionId,
+          task.id,
+          task.project_id,
+          task.agent,
+          String(model)
+        );
+
+        if (result.changes !== 1) {
+          return null;
+        }
+
+        event(sessionId, "task.claimed", {
+          taskId: task.id,
+        });
+
+        console.log(
+          "Claimed task:",
+          task.id.slice(0, 8)
+        );
+
+        if (providerState !== "ok") {
+          const reason =
+            providerReason ??
+            `Provider unavailable: ${providerState}`;
+
+          transition(sessionId, "queued", "failed", reason);
+
+          event(sessionId, "provider.preflight_refused", {
+            agent: task.agent,
+            state: providerState,
+            reason,
+            retry_at: retryAt,
+          });
+
+          console.log(
+            "Preflight refused:",
+            task.id.slice(0, 8),
+            reason
+          );
+
+          return null;
+        }
+
+        event(sessionId, "provider.preflight_passed", {
+          agent: task.agent,
+          state: providerState,
+        });
+
+        console.log(
+          "Preflight passed:",
+          task.id.slice(0, 8)
+        );
+
+        return sessionId;
+      })();
+
+      if (claimedSessionId) {
+        // Start outside the SQLite transaction.
+        transition(claimedSessionId, "queued", "running");
+        void runSession(claimedSessionId);
+      }
+    } catch (error) {
+      console.error(
+        "Failed to claim task:",
+        task.id,
+        error
+      );
+    }
+  }
 }
 
-async function processCommands() {
-  const commands = db.prepare(
-    `select c.id, c.session_id, c.kind
-     from commands c
-     where not exists (
-       select 1 from command_receipts r
-       where r.command_id = c.id
-     )
-     order by c.created_at`
-  ).all() as Command[];
+function saveCommandReceipt(
+  commandId: string,
+  outcome: "done" | "refused",
+  reason: string | null
+): void {
+  db.prepare(`
+    INSERT OR IGNORE INTO command_receipts (
+      command_id, outcome, reason
+    )
+    VALUES (?, ?, ?)
+  `).run(commandId, outcome, reason);
+}
+
+async function processCommands(): Promise<void> {
+  const commands = db.prepare(`
+    SELECT c.id, c.session_id, c.kind
+    FROM commands c
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM command_receipts r
+      WHERE r.command_id = c.id
+    )
+    ORDER BY c.created_at
+  `).all() as Command[];
 
   for (const command of commands) {
-    const existing = db.prepare(
-      "select command_id from command_receipts where command_id = ?"
-    ).get(command.id);
-    if (existing) continue;
-
     let outcome: "done" | "refused" = "refused";
     let reason: string | null = null;
-    const session = command.session_id
-      ? db.prepare("select id, status from sessions where id = ?").get(command.session_id) as Session | undefined
-      : undefined;
 
-    if (!session) {
-      reason = "Session not found or missing";
-    } else if (command.kind === "approve" || command.kind === "reject") {
-      const next: SessionStatus = command.kind === "approve" ? "approved" : "rejected";
-      if (!canTransition(session.status, next)) {
-        reason = `Cannot ${command.kind} from ${session.status}`;
+    try {
+      if (!command.session_id) {
+        reason = "Session not found or missing";
       } else {
-        try {
-          if (command.kind === "approve") {
-            const { branch, commit } = await runner.approve(session.id, "");
-            db.prepare(`update sessions set branch = ?, updated_at = ${NOW} where id = ?`)
-              .run(branch, session.id);
-            event(session.id, "session.approved", { branch, commit });
-          } else {
-            await runner.reject(session.id);
-            event(session.id, "task.rejected");
+        const session = getSession(command.session_id);
+
+        if (!session) {
+          reason = "Session not found";
+        } else {
+          switch (command.kind) {
+            case "stop": {
+              if (session.status !== "running") {
+                reason = `Cannot stop from ${session.status}`;
+                break;
+              }
+
+              await runner.stop(session.id);
+              transitionIfAllowed(session.id, "stopped");
+              outcome = "done";
+              break;
+            }
+
+            case "resume": {
+              if (session.status !== "stopped") {
+                reason = `Cannot resume from ${session.status}`;
+                break;
+              }
+
+              if (activeRuns.has(session.id)) {
+                reason = "Runner is still active";
+                break;
+              }
+
+              transition(session.id, "stopped", "running");
+              void runSession(session.id, true);
+              outcome = "done";
+              break;
+            }
+
+            case "approve": {
+              if (!canTransition(session.status, "approved")) {
+                reason =
+                  `Cannot approve from ${session.status}`;
+                break;
+              }
+
+              const result = await runner.approve(
+                session.id,
+                ""
+              );
+
+              db.prepare(`
+                UPDATE sessions
+                SET branch = ?,
+                    updated_at = ${NOW}
+                WHERE id = ?
+              `).run(result.branch, session.id);
+
+              transition(
+                session.id,
+                session.status,
+                "approved"
+              );
+
+              outcome = "done";
+              break;
+            }
+
+            case "reject": {
+              if (!canTransition(session.status, "rejected")) {
+                reason =
+                  `Cannot reject from ${session.status}`;
+                break;
+              }
+
+              await runner.reject(session.id);
+
+              transition(
+                session.id,
+                session.status,
+                "rejected"
+              );
+
+              outcome = "done";
+              break;
+            }
+
+            default:
+              reason =
+                `Unsupported command: ${command.kind}`;
           }
-          setStatus(session.id, next);
-          outcome = "done";
-        } catch (error) {
-          reason = error instanceof Error ? error.message : String(error);
-          if (reason.includes("unknown session")) {
-            setStatus(session.id, next, reason);
-            event(session.id, command.kind === "approve" ? "session.approved" : "task.rejected", { orphan: true });
-            outcome = "done";
-            reason = null;
-          }
         }
       }
-    } else if (command.kind === "stop") {
-      if (session.status !== "running" || !activeRuns.has(session.id)) {
-        reason = `Cannot stop a session while it is ${session.status}`;
-      } else {
-        try {
-          await runner.stop(session.id);
-          outcome = "done";
-        } catch (error) {
-          reason = error instanceof Error ? error.message : String(error);
-        }
-      }
-    } else if (command.kind === "resume") {
-      if (session.status !== "stopped") {
-        reason = `Cannot resume a session while it is ${session.status}`;
-      } else {
-        const task = loadTaskForSession(session.id);
-        if (!task) reason = "Task details are missing";
-        else {
-          setStatus(session.id, "running");
-          void runSession(task, session.id, "Continue the previous task.");
-          outcome = "done";
-        }
-      }
-    } else {
-      reason = `Unsupported command: ${command.kind}`;
+    } catch (error) {
+      reason =
+        error instanceof Error
+          ? error.message
+          : String(error);
+
+      console.error(
+        "Command failed:",
+        command.kind,
+        error
+      );
     }
 
-    db.prepare(
-      `insert into command_receipts
-       (command_id, outcome, reason)
-       values (?, ?, ?)`
-    ).run(command.id, outcome, reason);
-    console.log("Command:", command.kind, outcome, reason ?? "");
+    saveCommandReceipt(command.id, outcome, reason);
+
+    console.log(
+      "Command:",
+      command.kind,
+      outcome,
+      reason ?? ""
+    );
   }
 }
 
-function loadTaskForSession(sessionId: string): Task | undefined {
-  return db.prepare(
-    `select t.id, t.project_id, t.prompt, t.agent, t.models, p.path as repo_path
-     from sessions s join tasks t on t.id = s.task_id
-     join projects p on p.id = t.project_id where s.id = ?`
-  ).get(sessionId) as Task | undefined;
-}
-
-function recoverSessions() {
+function recoverSessions(): void {
   db.transaction(() => {
-    const sessions = db.prepare(
-      "select id, status from sessions where status = 'running'"
-    ).all() as Session[];
+    const sessions = db.prepare(`
+      SELECT id, status
+      FROM sessions
+      WHERE status = 'running'
+    `).all() as Session[];
 
     for (const session of sessions) {
       transition(
         session.id,
-        session.status,
+        "running",
         "failed",
         "Daemon restarted while session was running"
       );
-      console.log("Recovered interrupted session:", session.id);
+
+      console.log(
+        "Recovered interrupted session:",
+        session.id
+      );
     }
   })();
 }
 
-async function main() {
+async function main(): Promise<void> {
   console.log("CodeHands watcher starting...");
+  console.log(
+    "Runner mode:",
+    fakeMode ? "FAKE" : "REAL"
+  );
+
   recoverSessions();
 
   console.log("Watching SQLite database every 500ms");
@@ -309,11 +586,13 @@ async function main() {
     try {
       claimTasks();
       await processCommands();
-    } catch (err) {
-      console.error("Watcher error:", err);
+    } catch (error) {
+      console.error("Watcher error:", error);
     }
 
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await new Promise<void>(resolve =>
+      setTimeout(resolve, 500)
+    );
   }
 }
 
