@@ -1,12 +1,12 @@
 ﻿
-import { openDb } from "./db.js";
+import { inTransaction, openDb } from "./db.js";
 import type { RunnerEvent } from "../../../codehands-contracts/src/runner.ts";
 
 export function saveRunnerEvent(runnerEvent: RunnerEvent): number {
   const db = openDb();
 
   try {
-    return db.transaction(() => {
+    return inTransaction(db, () => {
       const row = db.prepare(`
         SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
         FROM events
@@ -33,7 +33,7 @@ export function saveRunnerEvent(runnerEvent: RunnerEvent): number {
       );
 
       return row.next_seq;
-    })();
+    });
   } finally {
     db.close();
   }
