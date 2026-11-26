@@ -1,5 +1,5 @@
 ﻿import { randomUUID } from "node:crypto";
-import { openDb } from "./db.js";
+import { inTransaction, openDb } from "./db.js";
 import {
   canTransition,
   type SessionStatus,
@@ -94,25 +94,31 @@ function transition(
     throw new Error(`Illegal transition: ${from} -> ${to}`);
   }
 
-  const result = db.prepare(`
-    UPDATE sessions
-    SET status = ?,
-        reason = ?,
-        updated_at = ${NOW}
-    WHERE id = ?
-      AND status = ?
-  `).run(to, reason, sessionId, from);
+  // The new status and its history event are saved together, or not at
+  // all. A crash between two separate saves would leave them disagreeing.
+  // claimTasks() and recoverSessions() call this inside their own
+  // transaction. inTransaction() then uses a savepoint, so nesting is safe.
+  inTransaction(db, () => {
+    const result = db.prepare(`
+      UPDATE sessions
+      SET status = ?,
+          reason = ?,
+          updated_at = ${NOW}
+      WHERE id = ?
+        AND status = ?
+    `).run(to, reason, sessionId, from);
 
-  if (result.changes !== 1) {
-    throw new Error(
-      `Session status changed concurrently: ${sessionId}`
-    );
-  }
+    if (result.changes !== 1) {
+      throw new Error(
+        `Session status changed concurrently: ${sessionId}`
+      );
+    }
 
-  event(sessionId, "session.status_changed", {
-    from,
-    to,
-    reason,
+    event(sessionId, "session.status_changed", {
+      from,
+      to,
+      reason,
+    });
   });
 }
 
@@ -291,7 +297,7 @@ function claimTasks(): void {
         }
       }
 
-      const claimedSessionId = db.transaction((): string | null => {
+      const claimedSessionId = inTransaction(db, (): string | null => {
         if (isSupportedAgent(task.agent) && !fakeMode) {
           db.prepare(`
             INSERT INTO provider_status (
@@ -383,12 +389,15 @@ function claimTasks(): void {
           task.id.slice(0, 8)
         );
 
+        // Part of the claim: a crash must not leave a claimed session in
+        // "queued", because nothing would ever pick it up again.
+        transition(sessionId, "queued", "running");
+
         return sessionId;
-      })();
+      });
 
       if (claimedSessionId) {
-        // Start outside the SQLite transaction.
-        transition(claimedSessionId, "queued", "running");
+        // Start the runner only after the transaction has committed.
         void runSession(claimedSessionId);
       }
     } catch (error) {
@@ -548,7 +557,7 @@ async function processCommands(): Promise<void> {
 }
 
 function recoverSessions(): void {
-  db.transaction(() => {
+  inTransaction(db, () => {
     const sessions = db.prepare(`
       SELECT id, status
       FROM sessions
@@ -568,7 +577,7 @@ function recoverSessions(): void {
         session.id
       );
     }
-  })();
+  });
 }
 
 async function main(): Promise<void> {

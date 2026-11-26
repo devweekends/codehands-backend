@@ -1,7 +1,7 @@
 ﻿import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-import { openDb } from "./db.js";
+import { inTransaction, openDb } from "./db.js";
 
 const dir = fileURLToPath(new URL("../migrations/", import.meta.url));
 
@@ -19,10 +19,10 @@ export function migrate(db = openDb()) {
   for (const f of files) {
     const version = parseInt(f, 10);
     if (applied.has(version)) continue;
-    db.transaction(() => {
+    inTransaction(db, () => {
       db.exec(readFileSync(join(dir, f), "utf8"));
       db.prepare("insert into schema_migrations (version) values (?)").run(version);
-    })();
+    });
     console.log("applied", f);
     count++;
   }

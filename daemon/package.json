@@ -15,17 +15,15 @@
   "author": "",
   "license": "ISC",
   "type": "module",
-  "dependencies": {
-    "better-sqlite3": "^13.0.3"
-  },
   "devDependencies": {
-    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.6.5",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   },
+  "engines": {
+    "node": ">=22.13"
+  },
   "allowScripts": {
-    "better-sqlite3@13.0.3": true,
     "esbuild@0.28.2": true
   }
 }

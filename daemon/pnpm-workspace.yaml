@@ -1,0 +1,4 @@
+# The daemon is installed on its own. Without this file, pnpm walks up to the
+# parent's pnpm-workspace.yaml and puts the packages in the parent folder.
+packages:
+  - "."
