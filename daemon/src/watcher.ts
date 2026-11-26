@@ -1,5 +1,6 @@
 ﻿import { randomUUID } from "node:crypto";
-import { inTransaction, openDb } from "./db.js";
+import { dbPath, inTransaction, openDb } from "./db.js";
+import { acquireDaemonLock } from "./lock.js";
 import {
   canTransition,
   type SessionStatus,
@@ -586,6 +587,16 @@ async function main(): Promise<void> {
     "Runner mode:",
     fakeMode ? "FAKE" : "REAL"
   );
+
+  // Must come before anything that changes data: recovery marks running
+  // sessions as failed, and the loop claims tasks and carries out commands.
+  if (!acquireDaemonLock()) {
+    console.error(
+      `Another daemon is already running for ${dbPath()}. Exiting.`
+    );
+    process.exitCode = 1;
+    return;
+  }
 
   recoverSessions();
 
