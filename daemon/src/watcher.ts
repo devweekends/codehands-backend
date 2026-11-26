@@ -12,11 +12,17 @@ import type {
 import {
   createFakeRunner,
   createRunner,
+  type RecoverableRunner,
 } from "../../../codehands-agent/runner/src/index.ts";
 import {
   checkProvider,
   getActiveProviderLimit,
 } from "./preflight.js";
+import {
+  decideRecovery,
+  runnerSessionFolder,
+  type RecoveryAction,
+} from "./recovery.js";
 import { buildStartOptions } from "./start-options.js";
 import { saveRunnerEvent } from "./runner-events.js";
 
@@ -25,9 +31,11 @@ const NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 
 // CODEHANDS_FAKE=true selects the fake runner, otherwise the real one.
 const fakeMode = process.env.CODEHANDS_FAKE === "true";
-const runner: Runner = fakeMode
-  ? createFakeRunner({ delayMs: 300 })
-  : createRunner();
+// Only the real runner saves its sessions, so only it can recover them.
+const realRunner: RecoverableRunner | undefined = fakeMode
+  ? undefined
+  : createRunner({ sessionRoot: runnerSessionFolder(dbPath()) });
+const runner: Runner = realRunner ?? createFakeRunner({ delayMs: 300 });
 
 const activeRuns = new Set<string>();
 
@@ -557,28 +565,84 @@ async function processCommands(): Promise<void> {
   }
 }
 
-function recoverSessions(): void {
+// The runner finished this button before the restart. Close the command that
+// is still waiting, or it would run again and be recorded as refused.
+function closeFinishedCommands(
+  sessionId: string,
+  kind: "approve" | "reject"
+): void {
+  db.prepare(`
+    INSERT OR IGNORE INTO command_receipts (command_id, outcome, reason)
+    SELECT c.id, 'done', 'Finished before the daemon restarted'
+    FROM commands c
+    WHERE c.session_id = ?
+      AND c.kind = ?
+      AND NOT EXISTS (
+        SELECT 1 FROM command_receipts r WHERE r.command_id = c.id
+      )
+  `).run(sessionId, kind);
+}
+
+function applyRecovery(session: Session, action: RecoveryAction): void {
+  if (action.kind === "unchanged") return;
+
+  if (action.kind === "warn") {
+    console.warn("Recovery:", session.id, action.message);
+    return;
+  }
+
+  // Status, history and receipts are saved together, or not at all.
   inTransaction(db, () => {
-    const sessions = db.prepare(`
-      SELECT id, status
-      FROM sessions
-      WHERE status = 'running'
-    `).all() as Session[];
+    transition(session.id, session.status, action.to, action.reason);
 
-    for (const session of sessions) {
-      transition(
+    if (action.to === "approved" || action.to === "rejected") {
+      closeFinishedCommands(
         session.id,
-        "running",
-        "failed",
-        "Daemon restarted while session was running"
-      );
-
-      console.log(
-        "Recovered interrupted session:",
-        session.id
+        action.to === "approved" ? "approve" : "reject"
       );
     }
   });
+
+  console.log(
+    "Recovered session:",
+    session.id,
+    `${session.status} -> ${action.to}`
+  );
+}
+
+// After a restart the database may be behind. The runner keeps its own record
+// of each session, so ask it before changing anything. If we are stopped half
+// way, running this again reaches the same result.
+async function recoverSessions(): Promise<void> {
+  if (realRunner) {
+    // keep: an interrupted run becomes "stopped" and keeps its private copy,
+    // so it can be resumed. Without keep, that copy is deleted.
+    const report = await realRunner.recover({ keep: () => true });
+
+    for (const problem of report.cleanupErrors) {
+      console.error(
+        "Runner could not clean up:",
+        problem.sessionId,
+        problem.reason
+      );
+    }
+  }
+
+  const sessions = db.prepare(`
+    SELECT id, status
+    FROM sessions
+    WHERE status IN ('running', 'stopped', 'awaiting_approval')
+  `).all() as Session[];
+
+  for (const session of sessions) {
+    // The fake runner saves nothing, so only its running sessions are lost.
+    if (!realRunner && session.status !== "running") continue;
+
+    applyRecovery(
+      session,
+      decideRecovery(session.status, realRunner?.status(session.id))
+    );
+  }
 }
 
 async function main(): Promise<void> {
@@ -598,7 +662,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  recoverSessions();
+  // Finishes before any task is claimed or any command is carried out. If the
+  // runner cannot recover, the daemon stops here rather than guess.
+  await recoverSessions();
 
   console.log("Watching SQLite database every 500ms");
 
