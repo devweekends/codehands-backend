@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { execaSync } from "execa";
 import { openDb } from "./db.js";
 
 type Agent = "codex" | "claude-code";
@@ -17,39 +17,33 @@ type ProviderResult = {
   retry_at: string | null;
 };
 
+// execa, not node:child_process: on Windows, npm installs a CLI as a .cmd file
+// (claude.cmd), and spawnSync cannot find that by the name "claude".
+function commandSucceeds(command: string, args: string[]): boolean {
+  const result = execaSync(command, args, {
+    reject: false, // a missing or failing CLI is an answer, not a crash
+    stdin: "ignore",
+    timeout: 5000,
+  });
+
+  return !result.failed;
+}
+
 // Check whether Codex or Claude Code is installed
 export function isCliInstalled(agent: Agent): boolean {
   const command = agent === "claude-code" ? "claude" : "codex";
 
-  const result = spawnSync(command, ["--version"], {
-    encoding: "utf8",
-    shell: false,
-    timeout: 5000,
-  });
-
-  return !result.error && result.status === 0;
+  return commandSucceeds(command, ["--version"]);
 }
 
 // Check Codex authentication
 export function isCodexLoggedIn(): boolean {
-  const result = spawnSync("codex", ["login", "status"], {
-    encoding: "utf8",
-    shell: false,
-    timeout: 5000,
-  });
-
-  return !result.error && result.status === 0;
+  return commandSucceeds("codex", ["login", "status"]);
 }
 
 // Check Claude Code authentication
 export function isClaudeLoggedIn(): boolean {
-  const result = spawnSync("claude", ["auth", "status"], {
-    encoding: "utf8",
-    shell: false,
-    timeout: 5000,
-  });
-
-  return !result.error && result.status === 0;
+  return commandSucceeds("claude", ["auth", "status"]);
 }
 
 // Check installation and authentication
